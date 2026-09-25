@@ -1,0 +1,13 @@
+{
+  "name": "lingore-real-mvp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {"dev":"vite","build":"vite build","preview":"vite preview"},
+  "dependencies": {
+    "@supabase/supabase-js": "^2.91.0",
+    "vite": "^7.0.0",
+    "typescript": "^5.0.0"
+  },
+  "devDependencies": {}
+}
