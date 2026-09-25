@@ -14,7 +14,11 @@ function btn(label, cls="primary", id=""){ return `<button id="${id}" class="${c
 async function boot(){
   const {data:{session:s}} = await supabase.auth.getSession();
   session=s;
-  supabase.auth.onAuthStateChange((_e,s)=>{ session=s; if(!s) renderLogin(); });
+  supabase.auth.onAuthStateChange((_e,s)=>{
+  session=s;
+  if(!s) return renderLogin();
+  loadProfile().then(()=>profile ? renderHome() : renderOnboarding());
+});
   if(!session) return renderLogin();
   await loadProfile();
   profile ? renderHome() : renderOnboarding();
