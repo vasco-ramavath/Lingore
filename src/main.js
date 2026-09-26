@@ -230,15 +230,18 @@ async function startMatching() {
     await enterCall(payload.call_id, payload.peer_id, payload.initiator);
   });
 
-  const sub = await matchingChannel.subscribe((status, err) => {
+  await matchingChannel.subscribe((status, err) => {
   console.log("MATCH REALTIME:", status, err);
 });
-  if (sub !== "SUBSCRIBED") {
-    cleanupMatch();
-    await leaveQueue();
-    alert("Could not connect to matchmaking. Please try again.");
-    return renderHome();
-  }
+
+const sub = matchingChannel.state;
+
+if (sub !== "joined") {
+  cleanupMatch();
+  await leaveQueue();
+  alert("Could not connect to matchmaking. Please try again.");
+  return renderHome();
+}
 
   const { data, error } = await supabase.rpc("find_or_queue_match", {
     p_native_language: profile.native_language,
