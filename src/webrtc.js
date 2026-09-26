@@ -22,6 +22,7 @@ export class VoiceCall {
 
     this.remoteDescriptionSet = false;
     this.pendingCandidates = [];
+
     this.ended = false;
     this.offerReceived = false;
     this.answerReceived = false;
@@ -38,7 +39,7 @@ export class VoiceCall {
       throw new Error("Call already ended.");
     }
 
-    // 1. Microphone
+    // Microphone
     this.localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -52,24 +53,58 @@ export class VoiceCall {
       this.pc.addTrack(track, this.localStream);
     });
 
-    // 2. Remote audio
+    // Remote audio
     this.pc.ontrack = event => {
+      console.log("REMOTE TRACK RECEIVED");
+
       if (!this.remoteAudio) {
-        this.remoteAudio = new Audio();
+        this.remoteAudio = document.createElement("audio");
         this.remoteAudio.autoplay = true;
         this.remoteAudio.playsInline = true;
+        this.remoteAudio.controls = false;
+        this.remoteAudio.volume = 1;
+
+        this.remoteAudio.style.display = "none";
+
+        document.body.appendChild(this.remoteAudio);
       }
 
-      this.remoteAudio.srcObject = event.streams[0];
+      const stream =
+        event.streams?.[0] ||
+        new MediaStream([event.track]);
 
-      this.remoteAudio.play().catch(() => {});
+      this.remoteAudio.srcObject = stream;
+
+      event.track.onunmute = async () => {
+        console.log("REMOTE AUDIO UNMUTED");
+
+        try {
+          await this.remoteAudio.play();
+          console.log("REMOTE AUDIO PLAYING");
+        } catch (error) {
+          console.warn(
+            "REMOTE AUDIO PLAY FAILED:",
+            error
+          );
+        }
+      };
+
+      this.remoteAudio.play().catch(error => {
+        console.warn(
+          "REMOTE AUDIO AUTOPLAY BLOCKED:",
+          error
+        );
+      });
     };
 
-    // 3. Connection state
+    // Connection state
     this.pc.onconnectionstatechange = () => {
       const state = this.pc.connectionState;
 
-      console.log("WEBRTC CONNECTION:", state);
+      console.log(
+        "WEBRTC CONNECTION:",
+        state
+      );
 
       if (state === "connected") {
         this.setState("connected");
@@ -87,12 +122,14 @@ export class VoiceCall {
         this.setState("failed");
       }
 
-      if (state === "closed" && !this.ended) {
+      if (
+        state === "closed" &&
+        !this.ended
+      ) {
         this.setState("remote-hangup");
       }
     };
 
-    // 4. ICE state
     this.pc.oniceconnectionstatechange = () => {
       console.log(
         "WEBRTC ICE:",
@@ -100,9 +137,11 @@ export class VoiceCall {
       );
     };
 
-    // 5. ICE candidates
+    // ICE candidates
     this.pc.onicecandidate = async event => {
-      if (!event.candidate || this.ended) return;
+      if (!event.candidate || this.ended) {
+        return;
+      }
 
       try {
         await this.sendSignal({
@@ -113,24 +152,29 @@ export class VoiceCall {
           from: this.userId
         });
       } catch (error) {
-        console.error("ICE send error:", error);
+        console.error(
+          "ICE SEND ERROR:",
+          error
+        );
       }
     };
 
-    // 6. Get current authenticated session
+    // Supabase session
     const {
       data: { session }
     } = await supabase.auth.getSession();
 
     if (!session?.access_token) {
-      throw new Error("Authentication session expired.");
+      throw new Error(
+        "Authentication session expired."
+      );
     }
 
-    // 7. IMPORTANT:
-    // Authenticate Supabase Realtime BEFORE private channel subscribe.
-    await supabase.realtime.setAuth(session.access_token);
+    await supabase.realtime.setAuth(
+      session.access_token
+    );
 
-    // 8. Create private call channel
+    // Private call channel
     this.channel = supabase.channel(
       `call:${this.callId}`,
       {
@@ -143,7 +187,7 @@ export class VoiceCall {
       }
     );
 
-    // 9. Receive WebRTC signals
+    // Signaling
     this.channel.on(
       "broadcast",
       { event: "signal" },
@@ -163,8 +207,6 @@ export class VoiceCall {
 
         try {
           if (payload.type === "ready") {
-            // Remote user is ready.
-            // Initiator will create the offer.
             if (
               this.userId < this.remoteUserId &&
               !this.offerReceived &&
@@ -174,15 +216,19 @@ export class VoiceCall {
             }
           }
 
-          else if (payload.type === "offer") {
-            await this.handleOffer(payload.offer);
+          if (payload.type === "offer") {
+            await this.handleOffer(
+              payload.offer
+            );
           }
 
-          else if (payload.type === "answer") {
-            await this.handleAnswer(payload.answer);
+          if (payload.type === "answer") {
+            await this.handleAnswer(
+              payload.answer
+            );
           }
 
-          else if (
+          if (
             payload.type === "ice" &&
             payload.candidate
           ) {
@@ -191,10 +237,15 @@ export class VoiceCall {
             );
           }
 
-          else if (payload.type === "hangup") {
-            this.setState("remote-hangup");
-          }
+          if (payload.type === "hangup") {
+            console.log(
+              "REMOTE HANGUP RECEIVED"
+            );
 
+            this.setState(
+              "remote-hangup"
+            );
+          }
         } catch (error) {
           console.error(
             "WEBRTC SIGNAL ERROR:",
@@ -206,63 +257,63 @@ export class VoiceCall {
       }
     );
 
-    // 10. Subscribe correctly
-    await new Promise((resolve, reject) => {
-      let finished = false;
+    // Subscribe correctly
+    await new Promise(
+      (resolve, reject) => {
+        let finished = false;
 
-      const timeout = setTimeout(() => {
-        if (finished) return;
-
-        finished = true;
-
-        reject(
-          new Error(
-            "Call signaling timed out."
-          )
-        );
-      }, 15000);
-
-      this.channel.subscribe((status, err) => {
-        console.log(
-          "CALL REALTIME:",
-          status,
-          err
-        );
-
-        if (status === "SUBSCRIBED") {
+        const timeout = setTimeout(() => {
           if (finished) return;
 
           finished = true;
-          clearTimeout(timeout);
-
-          resolve();
-          return;
-        }
-
-        if (
-          status === "CHANNEL_ERROR" ||
-          status === "TIMED_OUT" ||
-          status === "CLOSED"
-        ) {
-          if (finished) return;
-
-          finished = true;
-          clearTimeout(timeout);
-
-          console.error(
-            "CALL CHANNEL ERROR:",
-            status,
-            err
-          );
 
           reject(
             new Error(
-              `Call signaling ${status}`
+              "Call signaling timed out."
             )
           );
-        }
-      });
-    });
+        }, 15000);
+
+        this.channel.subscribe(
+          (status, err) => {
+            console.log(
+              "CALL REALTIME:",
+              status,
+              err
+            );
+
+            if (
+              status === "SUBSCRIBED"
+            ) {
+              if (finished) return;
+
+              finished = true;
+              clearTimeout(timeout);
+
+              resolve();
+              return;
+            }
+
+            if (
+              status === "CHANNEL_ERROR" ||
+              status === "TIMED_OUT" ||
+              status === "CLOSED"
+            ) {
+              if (finished) return;
+
+              finished = true;
+              clearTimeout(timeout);
+
+              reject(
+                new Error(
+                  `Call signaling ${status}`
+                )
+              );
+            }
+          }
+        );
+      }
+    );
 
     console.log(
       "CALL CHANNEL CONNECTED:",
@@ -271,7 +322,7 @@ export class VoiceCall {
 
     this.setState("connecting");
 
-    // 11. Tell the other user we are ready.
+    // Tell the other phone we're ready
     await this.sendSignal({
       type: "ready",
       from: this.userId
@@ -279,18 +330,22 @@ export class VoiceCall {
   }
 
   async sendSignal(payload) {
+    if (!this.channel) {
+      return;
+    }
+
     if (
-      !this.channel ||
-      this.ended
+      this.channel.state !== "joined"
     ) {
       return;
     }
 
-    const result = await this.channel.send({
-      type: "broadcast",
-      event: "signal",
-      payload
-    });
+    const result =
+      await this.channel.send({
+        type: "broadcast",
+        event: "signal",
+        payload
+      });
 
     console.log(
       "CALL SIGNAL SENT:",
@@ -308,7 +363,9 @@ export class VoiceCall {
       return;
     }
 
-    console.log("CREATING OFFER");
+    console.log(
+      "CREATING OFFER"
+    );
 
     const offer =
       await this.pc.createOffer();
@@ -332,7 +389,9 @@ export class VoiceCall {
       return;
     }
 
-    console.log("RECEIVED OFFER");
+    console.log(
+      "RECEIVED OFFER"
+    );
 
     this.offerReceived = true;
 
@@ -351,7 +410,9 @@ export class VoiceCall {
       answer
     );
 
-    console.log("SENDING ANSWER");
+    console.log(
+      "SENDING ANSWER"
+    );
 
     await this.sendSignal({
       type: "answer",
@@ -369,7 +430,9 @@ export class VoiceCall {
       return;
     }
 
-    console.log("RECEIVED ANSWER");
+    console.log(
+      "RECEIVED ANSWER"
+    );
 
     this.answerReceived = true;
 
@@ -390,7 +453,9 @@ export class VoiceCall {
       return;
     }
 
-    if (!this.remoteDescriptionSet) {
+    if (
+      !this.remoteDescriptionSet
+    ) {
       this.pendingCandidates.push(
         candidate
       );
@@ -403,7 +468,7 @@ export class VoiceCall {
       );
     } catch (error) {
       console.warn(
-        "ICE candidate error:",
+        "ICE CANDIDATE ERROR:",
         error
       );
     }
@@ -427,7 +492,7 @@ export class VoiceCall {
         );
       } catch (error) {
         console.warn(
-          "Queued ICE error:",
+          "QUEUED ICE ERROR:",
           error
         );
       }
@@ -445,10 +510,12 @@ export class VoiceCall {
   }
 
   async end(notifyRemote = true) {
-    if (this.ended) return;
+    if (this.ended) {
+      return;
+    }
 
-    this.ended = true;
-
+    // IMPORTANT:
+    // Send hangup BEFORE setting ended=true.
     if (
       notifyRemote &&
       this.channel
@@ -458,13 +525,26 @@ export class VoiceCall {
           type: "hangup",
           from: this.userId
         });
-      } catch (_) {}
+
+        console.log(
+          "HANGUP SENT"
+        );
+      } catch (error) {
+        console.warn(
+          "HANGUP SEND ERROR:",
+          error
+        );
+      }
     }
+
+    this.ended = true;
 
     if (this.localStream) {
       this.localStream
         .getTracks()
-        .forEach(track => track.stop());
+        .forEach(track => {
+          track.stop();
+        });
 
       this.localStream = null;
     }
@@ -472,6 +552,16 @@ export class VoiceCall {
     try {
       this.pc.close();
     } catch (_) {}
+
+    if (this.remoteAudio) {
+      try {
+        this.remoteAudio.pause();
+        this.remoteAudio.srcObject = null;
+        this.remoteAudio.remove();
+      } catch (_) {}
+
+      this.remoteAudio = null;
+    }
 
     if (this.channel) {
       try {
@@ -482,7 +572,5 @@ export class VoiceCall {
 
       this.channel = null;
     }
-
-    this.remoteAudio = null;
   }
-    }
+}
