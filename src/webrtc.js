@@ -112,54 +112,86 @@ export class VoiceCall {
       } catch (_) {}
     };
 
-    this.channel = supabase.channel(`call:${this.callId}`, {
-      config: {
-        private: true
-      }
-    });
+    const { data: { session } } = await supabase.auth.getSession();
 
-    this.channel.on(
-      "broadcast",
-      { event: "signal" },
-      async ({ payload }) => {
-        if (
-          this.ended ||
-          !payload ||
-          payload.from === this.userId
-        ) {
-          return;
-        }
+if (!session?.access_token) {
+  throw new Error("Authentication session expired.");
+}
 
-        try {
-          if (payload.type === "offer") {
-            await this.handleOffer(payload.offer);
-          }
+await supabase.realtime.setAuth(session.access_token);
 
-          if (payload.type === "answer") {
-            await this.handleAnswer(payload.answer);
-          }
+this.channel = supabase.channel(`call:${this.callId}`, {
+  config: {
+    private: true
+  }
+});
 
-          if (payload.type === "ice" && payload.candidate) {
-            await this.handleIceCandidate(payload.candidate);
-          }
-
-          if (payload.type === "hangup") {
-            this.setState("remote-hangup");
-          }
-        } catch (error) {
-          console.error("WebRTC signal error:", error);
-          this.setState("failed");
-        }
-      }
-    );
-
-    const status = await this.channel.subscribe();
-
-    if (status !== "SUBSCRIBED") {
-      throw new Error("Could not connect to call signaling.");
+this.channel.on(
+  "broadcast",
+  { event: "signal" },
+  async ({ payload }) => {
+    if (
+      this.ended ||
+      !payload ||
+      payload.from === this.userId
+    ) {
+      return;
     }
 
-    this.setState("connecting");
+    try {
+      if (payload.type === "offer") {
+        await this.handleOffer(payload.offer);
+      }
+
+      if (payload.type === "answer") {
+        await this.handleAnswer(payload.answer);
+      }
+
+      if (payload.type === "ice" && payload.candidate) {
+        await this.handleIceCandidate(payload.candidate);
+      }
+
+      if (payload.type === "hangup") {
+        this.setState("remote-hangup");
+      }
+    } catch (error) {
+      console.error("WebRTC signal error:", error);
+      this.setState("failed");
+    }
+  }
+);
+
+await new Promise((resolve, reject) => {
+  const timeout = setTimeout(() => {
+    reject(new Error("Call signaling timed out."));
+  }, 10000);
+
+  this.channel.subscribe((status, err) => {
+    console.log("CALL REALTIME:", status, err);
+
+    if (status === "SUBSCRIBED") {
+      clearTimeout(timeout);
+      resolve();
+      return;
+    }
+
+    if (
+      status === "CHANNEL_ERROR" ||
+      status === "TIMED_OUT" ||
+      status === "CLOSED"
+    ) {
+      clearTimeout(timeout);
+
+      reject(
+        err instanceof Error
+          ? err
+          : new Error(`Call signaling ${status}`)
+      );
+    }
+  });
+});
+
+this.setState("connecting");
   }
 
   async sendSignal(payload) {
