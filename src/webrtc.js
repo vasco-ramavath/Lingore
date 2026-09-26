@@ -1,5 +1,7 @@
 import { supabase } from "./supabase.js";
 
+// STUN helps discover direct routes. TURN is still required for some
+// carrier/NAT combinations; see the notes after deployment if ICE fails.
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" }
@@ -16,12 +18,12 @@ export class VoiceCall {
     this.channel = null;
     this.localStream = null;
     this.remoteAudio = null;
+    this.remoteStream = null;
     this.pendingIce = [];
     this.remoteDescriptionSet = false;
     this.ended = false;
-    this.restartTimer = null;
-    this.restartAttempts = 0;
-    this.restartInProgress = false;
+    this.speakerEnabled = true;
+    this.restartAttempted = false;
 
     this.onState = () => {};
 
@@ -29,318 +31,252 @@ export class VoiceCall {
       const state = this.pc.connectionState;
       console.log("WEBRTC CONNECTION:", state);
       this.onState(state);
-
-      if (state === "connected") {
-        this.restartAttempts = 0;
-        this.restartInProgress = false;
-        if (this.restartTimer) clearTimeout(this.restartTimer);
-        this.restartTimer = null;
-      } else if (state === "disconnected") {
-        this.scheduleIceRestart();
-      } else if (state === "failed") {
-        this.scheduleIceRestart();
+      if(state === "disconnected" && !this.ended){
+        setTimeout(()=>this.tryIceRestart(),1500);
       }
     };
 
     this.pc.oniceconnectionstatechange = () => {
       const state = this.pc.iceConnectionState;
       console.log("WEBRTC ICE:", state);
-      if (state === "connected" || state === "completed") {
-        this.restartAttempts = 0;
-        this.restartInProgress = false;
-      } else if (state === "disconnected" || state === "failed") {
-        this.scheduleIceRestart();
+      if(state === "failed" && !this.ended){
+        this.tryIceRestart();
       }
     };
 
-    this.pc.onicecandidateerror = event => {
-      console.warn("WEBRTC ICE CANDIDATE ERROR:", event);
-    };
+    this.pc.onicecandidateerror = event => console.warn("WEBRTC ICE CANDIDATE ERROR:",event);
 
     this.pc.ontrack = event => {
-      console.log("REMOTE TRACK RECEIVED");
-      const stream = event.streams?.[0];
-      if (!stream) return;
+      console.log("REMOTE TRACK RECEIVED", event.track?.kind);
+      let stream = event.streams?.[0];
+      if(!stream){
+        if(!this.remoteStream) this.remoteStream=new MediaStream();
+        this.remoteStream.addTrack(event.track);
+        stream=this.remoteStream;
+      }else{
+        this.remoteStream=stream;
+      }
 
-      if (!this.remoteAudio) {
-        this.remoteAudio = document.createElement("audio");
-        this.remoteAudio.id = `lingore-remote-${this.callId}`;
-        this.remoteAudio.autoplay = true;
-        this.remoteAudio.playsInline = true;
-        this.remoteAudio.controls = false;
-        this.remoteAudio.volume = 1;
-        this.remoteAudio.style.display = "none";
+      if(!this.remoteAudio){
+        this.remoteAudio=document.createElement("audio");
+        this.remoteAudio.id=`lingore-remote-${this.callId}`;
+        this.remoteAudio.autoplay=true;
+        this.remoteAudio.playsInline=true;
+        this.remoteAudio.preload="auto";
+        this.remoteAudio.controls=false;
+        this.remoteAudio.volume=1;
+        this.remoteAudio.muted=false;
+        this.remoteAudio.setAttribute("aria-hidden","true");
+        this.remoteAudio.style.position="fixed";
+        this.remoteAudio.style.width="1px";
+        this.remoteAudio.style.height="1px";
+        this.remoteAudio.style.opacity="0.01";
+        this.remoteAudio.style.pointerEvents="none";
         document.body.appendChild(this.remoteAudio);
       }
 
-      this.remoteAudio.srcObject = stream;
-
-      const playRemote = async () => {
-        if (!this.remoteAudio || this.ended) return;
-        try {
-          await this.remoteAudio.play();
-          console.log("REMOTE AUDIO PLAYING");
-        } catch (error) {
-          console.warn("REMOTE AUDIO PLAY BLOCKED:", error);
-        }
-      };
-
-      playRemote();
-      event.track.onunmute = playRemote;
+      this.remoteAudio.srcObject=stream;
+      event.track.onunmute=()=>this.playRemoteAudio();
+      this.playRemoteAudio();
     };
 
-    this.pc.onicecandidate = async event => {
-      if (!event.candidate || this.ended) return;
-      try {
-        await this.sendSignal({
-          type: "ice",
-          candidate: event.candidate.toJSON ? event.candidate.toJSON() : event.candidate,
-          from: this.userId
-        });
-      } catch (error) {
-        console.warn("ICE SEND ERROR:", error);
-      }
+    this.pc.onicecandidate=async event=>{
+      if(!event.candidate || this.ended) return;
+      try{
+        await this.sendSignal({type:"ice",candidate:event.candidate,from:this.userId});
+      }catch(e){ console.warn("ICE SEND ERROR:",e); }
     };
   }
 
-  async start() {
-    if (this.ended) throw new Error("Call already ended.");
+  async start(){
+    if(this.ended) throw new Error("Call already ended.");
 
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session?.access_token) throw new Error("Authentication session expired.");
-
+    const {data:{session}}=await supabase.auth.getSession();
+    if(!session?.access_token) throw new Error("Authentication session expired.");
     await supabase.realtime.setAuth(session.access_token);
 
-    this.localStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1
+    this.localStream=await navigator.mediaDevices.getUserMedia({
+      audio:{
+        echoCancellation:true,
+        noiseSuppression:true,
+        autoGainControl:true,
+        channelCount:1
       },
-      video: false
+      video:false
     });
 
-    for (const track of this.localStream.getAudioTracks()) {
-      track.enabled = true;
-      this.pc.addTrack(track, this.localStream);
-    }
-
-    this.channel = supabase.channel(`call:${this.callId}`, {
-      config: {
-        private: true,
-        broadcast: { ack: true, self: false }
-      }
+    this.localStream.getAudioTracks().forEach(track=>{
+      track.enabled=true;
+      this.pc.addTrack(track,this.localStream);
     });
 
-    this.channel.on("broadcast", { event: "signal" }, async ({ payload }) => {
-      if (!payload || payload.from === this.userId || this.ended) return;
+    this.channel=supabase.channel(`call:${this.callId}`,{
+      config:{private:true,broadcast:{ack:true,self:false}}
+    });
 
-      try {
-        if (payload.type === "ready") {
+    this.channel.on("broadcast",{event:"signal"},async({payload})=>{
+      if(!payload || payload.from===this.userId || this.ended) return;
+      try{
+        if(payload.type==="ready"){
           console.log("SIGNAL READY RECEIVED");
-          if (this.isInitiator && !this.pc.localDescription) {
-            await this.createAndSendOffer(false);
-          }
+          if(this.isInitiator && !this.pc.localDescription) await this.createAndSendOffer();
           return;
         }
 
-        if (payload.type === "offer") {
+        if(payload.type==="offer"){
           console.log("SIGNAL OFFER RECEIVED");
-          await this.handleOffer(payload.offer);
+          await this.pc.setRemoteDescription(payload.offer);
+          this.remoteDescriptionSet=true;
+          await this.flushPendingIce();
+          const answer=await this.pc.createAnswer();
+          await this.pc.setLocalDescription(answer);
+          await this.sendSignal({type:"answer",answer:this.pc.localDescription,from:this.userId});
+          console.log("SIGNAL ANSWER SENT");
           return;
         }
 
-        if (payload.type === "answer") {
+        if(payload.type==="answer"){
           console.log("SIGNAL ANSWER RECEIVED");
-          if (!this.pc.remoteDescription) {
+          if(!this.pc.remoteDescription){
             await this.pc.setRemoteDescription(payload.answer);
-            this.remoteDescriptionSet = true;
+            this.remoteDescriptionSet=true;
             await this.flushPendingIce();
           }
           return;
         }
 
-        if (payload.type === "ice" && payload.candidate) {
-          if (this.remoteDescriptionSet || this.pc.remoteDescription) {
+        if(payload.type==="ice" && payload.candidate){
+          if(this.remoteDescriptionSet || this.pc.remoteDescription){
             await this.pc.addIceCandidate(payload.candidate);
-          } else {
+          }else{
             this.pendingIce.push(payload.candidate);
           }
           return;
         }
 
-        if (payload.type === "hangup") {
+        if(payload.type==="hangup"){
           console.log("REMOTE HANGUP RECEIVED");
           this.onState("remote-hangup");
         }
-      } catch (error) {
-        console.error("SIGNAL HANDLER ERROR:", error);
+      }catch(error){
+        console.error("SIGNAL HANDLER ERROR:",error);
         this.onState("signaling-error");
       }
     });
 
     await this.subscribe();
-
-    // Both phones send ready only after their own private channel is subscribed.
-    // Either ready can arrive first; the elected initiator creates the offer
-    // only when it receives the peer's ready, eliminating the lost-offer race.
-    await this.sendSignal({ type: "ready", from: this.userId });
+    await this.sendSignal({type:"ready",from:this.userId});
     return this;
   }
 
-  async subscribe() {
-    await new Promise((resolve, reject) => {
-      let done = false;
-      this.channel.subscribe((status, error) => {
-        console.log("CALL CHANNEL:", status, error || "");
-        if (status === "SUBSCRIBED") {
-          done = true;
+  async subscribe(){
+    await new Promise((resolve,reject)=>{
+      let finished=false;
+      this.channel.subscribe((status,error)=>{
+        console.log("CALL CHANNEL:",status,error||"");
+        if(status==="SUBSCRIBED"){
+          finished=true;
           resolve();
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-          if (!done) {
-            done = true;
-            reject(error || new Error(`Call signaling status: ${status}`));
-          }
+        }else if((status==="CHANNEL_ERROR"||status==="TIMED_OUT"||status==="CLOSED")&&!finished){
+          finished=true;
+          reject(error||new Error(`Call signaling status: ${status}`));
         }
       });
     });
   }
 
-  async createAndSendOffer(iceRestart = false) {
-    if (this.ended || this.pc.signalingState !== "stable") return;
-
-    const offer = await this.pc.createOffer(
-      iceRestart ? { iceRestart: true, offerToReceiveAudio: true } : { offerToReceiveAudio: true }
-    );
+  async createAndSendOffer(){
+    if(this.ended || this.pc.localDescription) return;
+    const offer=await this.pc.createOffer({offerToReceiveAudio:true});
     await this.pc.setLocalDescription(offer);
-
-    await this.sendSignal({
-      type: "offer",
-      offer: this.pc.localDescription,
-      from: this.userId
-    });
-    console.log(iceRestart ? "SIGNAL ICE RESTART OFFER SENT" : "SIGNAL OFFER SENT");
+    await this.sendSignal({type:"offer",offer:this.pc.localDescription,from:this.userId});
+    console.log("SIGNAL OFFER SENT");
   }
 
-  async handleOffer(offer) {
-    if (this.ended || !offer) return;
-
-    // An ICE-restart offer is a normal new offer. The callee answers it.
-    await this.pc.setRemoteDescription(offer);
-    this.remoteDescriptionSet = true;
-    await this.flushPendingIce();
-
-    const answer = await this.pc.createAnswer();
-    await this.pc.setLocalDescription(answer);
-    await this.sendSignal({
-      type: "answer",
-      answer: this.pc.localDescription,
-      from: this.userId
-    });
-    console.log("SIGNAL ANSWER SENT");
-  }
-
-  async flushPendingIce() {
-    if (!this.remoteDescriptionSet && !this.pc.remoteDescription) return;
-    const queued = this.pendingIce.splice(0);
-    for (const candidate of queued) {
-      try {
-        await this.pc.addIceCandidate(candidate);
-      } catch (error) {
-        console.warn("QUEUED ICE ERROR:", error);
-      }
+  async flushPendingIce(){
+    if(!this.remoteDescriptionSet && !this.pc.remoteDescription) return;
+    const queued=this.pendingIce.splice(0);
+    for(const candidate of queued){
+      try{ await this.pc.addIceCandidate(candidate); }catch(e){ console.warn("QUEUED ICE ERROR:",e); }
     }
   }
 
-  scheduleIceRestart() {
-    if (this.ended || !this.isInitiator || this.restartAttempts >= 3 || this.restartTimer) return;
-
-    this.restartTimer = setTimeout(async () => {
-      this.restartTimer = null;
-      if (this.ended || this.pc.connectionState === "connected") return;
-      if (this.pc.signalingState !== "stable") {
-        this.scheduleIceRestart();
-        return;
-      }
-
-      this.restartAttempts += 1;
-      this.restartInProgress = true;
-      try {
-        if (typeof this.pc.restartIce === "function") this.pc.restartIce();
-        await this.createAndSendOffer(true);
-      } catch (error) {
-        console.warn("ICE RESTART ERROR:", error);
-      } finally {
-        this.restartInProgress = false;
-      }
-    }, 1500);
+  async sendSignal(payload){
+    if(!this.channel || this.ended) return;
+    const result=await this.channel.send({type:"broadcast",event:"signal",payload});
+    if(result && result!=="ok") throw new Error(`Signal send failed: ${result}`);
   }
 
-  // Kept only for compatibility with older code. New main.js does not call these.
-  async offer() {
-    await this.createAndSendOffer(false);
+  async mute(muted){
+    this.localStream?.getAudioTracks().forEach(track=>track.enabled=!muted);
   }
 
-  async answer() {
-    if (!this.pc.remoteDescription || this.pc.localDescription) return;
-    const answer = await this.pc.createAnswer();
-    await this.pc.setLocalDescription(answer);
-    await this.sendSignal({ type: "answer", answer: this.pc.localDescription, from: this.userId });
+  async playRemoteAudio(){
+    if(!this.remoteAudio) return false;
+    this.remoteAudio.muted=!this.speakerEnabled;
+    try{
+      await this.remoteAudio.play();
+      console.log("REMOTE AUDIO PLAYING");
+      this.onState("remote-audio");
+      return true;
+    }catch(error){
+      console.warn("REMOTE AUDIO PLAY BLOCKED:",error);
+      this.onState("audio-blocked");
+      return false;
+    }
   }
 
-  async mute(muted) {
-    this.localStream?.getAudioTracks().forEach(track => {
-      track.enabled = !muted;
-    });
+  async toggleSpeaker(){
+    this.speakerEnabled=!this.speakerEnabled;
+    if(this.remoteAudio){
+      this.remoteAudio.muted=!this.speakerEnabled;
+      if(this.speakerEnabled) await this.playRemoteAudio();
+    }
+    return this.speakerEnabled;
   }
 
-  async end(notifyRemote = true) {
-    if (this.ended) return;
+  async tryIceRestart(){
+    if(this.ended || this.restartAttempted || !this.channel) return;
+    if(!["failed","disconnected"].includes(this.pc.iceConnectionState)) return;
+    this.restartAttempted=true;
+    try{
+      console.log("TRYING ICE RESTART");
+      const offer=await this.pc.createOffer({iceRestart:true,offerToReceiveAudio:true});
+      await this.pc.setLocalDescription(offer);
+      await this.sendSignal({type:"offer",offer:this.pc.localDescription,from:this.userId,iceRestart:true});
+    }catch(e){
+      console.warn("ICE RESTART FAILED:",e);
+    }
+  }
 
-    console.log("ENDING CALL", { notifyRemote });
+  async end(notifyRemote=true){
+    if(this.ended) return;
+    console.log("ENDING CALL",{notifyRemote});
 
-    // Hangup MUST be sent before ended=true, otherwise sendSignal() refuses it.
-    if (notifyRemote && this.channel) {
-      try {
-        await this.sendSignal({ type: "hangup", from: this.userId });
-        console.log("HANGUP SENT");
-        await new Promise(resolve => setTimeout(resolve, 120));
-      } catch (error) {
-        console.warn("HANGUP SEND ERROR:", error);
-      }
+    if(notifyRemote && this.channel){
+      try{
+        await this.sendSignal({type:"hangup",from:this.userId});
+        await new Promise(r=>setTimeout(r,120));
+      }catch(e){ console.warn("HANGUP SEND ERROR:",e); }
     }
 
-    this.ended = true;
-    if (this.restartTimer) clearTimeout(this.restartTimer);
-    this.restartTimer = null;
+    this.ended=true;
+    this.localStream?.getTracks().forEach(track=>track.stop());
+    this.localStream=null;
 
-    this.localStream?.getTracks().forEach(track => track.stop());
-    this.localStream = null;
-
-    if (this.remoteAudio) {
+    if(this.remoteAudio){
       this.remoteAudio.pause();
-      this.remoteAudio.srcObject = null;
+      this.remoteAudio.srcObject=null;
       this.remoteAudio.remove();
-      this.remoteAudio = null;
+      this.remoteAudio=null;
     }
 
-    this.pc.ontrack = null;
-    try { this.pc.close(); } catch (_) {}
+    this.pc.ontrack=null;
+    this.pc.close();
 
-    if (this.channel) {
-      try { await supabase.removeChannel(this.channel); } catch (_) {}
-      this.channel = null;
+    if(this.channel){
+      try{await supabase.removeChannel(this.channel);}catch{}
+      this.channel=null;
     }
-  }
-
-  async sendSignal(payload) {
-    if (!this.channel || this.ended) return;
-    const result = await this.channel.send({
-      type: "broadcast",
-      event: "signal",
-      payload
-    });
-    if (result && result !== "ok") console.warn("SIGNAL SEND RESULT:", result);
   }
 }
