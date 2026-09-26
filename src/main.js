@@ -218,7 +218,7 @@ async function startMatching() {
   };
 
   // Subscribe before queueing so the waiting user cannot miss a fast match event.
-  await supabase.realtime.setAuth(session.access_token); matchingChannel = supabase.channel(`match:${session.user.id}`, { config: { private: true } });
+  matchingChannel = supabase.channel(`match:${session.user.id}`, { config: { private: true } });
   matchingChannel.on("broadcast", { event: "matched" }, async ({ payload }) => {
     if (!matchingActive) return;
     matchingActive = false;
@@ -230,29 +230,37 @@ async function startMatching() {
     await enterCall(payload.call_id, payload.peer_id, payload.initiator);
   });
 
-  const sub = await new Promise((resolve) => {
-  matchingChannel.subscribe((status, err) => {
-    console.log("MATCH REALTIME:", status, err);
+  // Private Realtime channels must be authorized before subscribing.
+  const { data: { session: freshSession } } = await supabase.auth.getSession();
+  if (!freshSession?.access_token) {
+    cleanupMatch();
+    await leaveQueue();
+    alert("Your login session expired. Please sign in again.");
+    return renderLogin();
+  }
+  await supabase.realtime.setAuth(freshSession.access_token);
 
-    if (status === "SUBSCRIBED") {
-      resolve("SUBSCRIBED");
-    } else if (
-      status === "CHANNEL_ERROR" ||
-      status === "TIMED_OUT" ||
-      status === "CLOSED"
-    ) {
-      console.error("MATCH CHANNEL ERROR:", status, err);
-      resolve(status);
-    }
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    matchingChannel.subscribe((status, error) => {
+      console.log("MATCH CHANNEL:", status, error || "");
+      if (status === "SUBSCRIBED") {
+        settled = true;
+        resolve();
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        if (!settled) {
+          settled = true;
+          reject(error || new Error(`Match channel status: ${status}`));
+        }
+      }
+    });
+  }).catch(async error => {
+    console.error("MATCH CHANNEL ERROR:", error);
+    cleanupMatch();
+    await leaveQueue();
+    alert("Could not connect to matchmaking. Please try again.");
+    throw error;
   });
-});
-
-if (sub !== "SUBSCRIBED") {
-  cleanupMatch();
-  await leaveQueue();
-  alert("Could not connect to matchmaking. Please try again.");
-  return renderHome();
-}
 
   const { data, error } = await supabase.rpc("find_or_queue_match", {
     p_native_language: profile.native_language,
@@ -300,6 +308,9 @@ function renderMatchTimeout() {
 }
 
 async function enterCall(callId, peerId, initiator) {
+  // initiator is retained for compatibility with the database payload.
+  // VoiceCall deterministically elects one offerer so both phones agree.
+  void initiator;
   layout(`<section class="call">
     <div class="callbar"><span>Lingore call</span><span id="clock">00:00</span></div>
     <div class="person">
@@ -323,10 +334,15 @@ async function enterCall(callId, peerId, initiator) {
       if (state === "connected") {
         if (title) title.textContent = "Connected";
         if (badge) badge.textContent = "Connected";
-      } else if (state === "disconnected" || state === "failed") {
-        if (title) title.textContent = state === "failed" ? "Connection failed" : "Disconnected";
-        if (badge) badge.textContent = state === "failed" ? "Connection failed" : "Disconnected";
-        if (state === "failed") finishCall(true);
+      } else if (state === "disconnected" || state === "ice-failed" || state === "failed") {
+        if (state === "disconnected" || state === "ice-failed") {
+          if (title) title.textContent = "Reconnecting";
+          if (badge) badge.textContent = "Reconnecting";
+        } else {
+          if (title) title.textContent = "Connection failed";
+          if (badge) badge.textContent = "Connection failed";
+          finishCall(true);
+        }
       } else if (state === "remote-hangup") {
         finishCall(true);
       } else if (title) {
@@ -335,6 +351,10 @@ async function enterCall(callId, peerId, initiator) {
       }
     };
 
+    // WebRTC negotiation is now fully automatic inside VoiceCall.
+    // Do NOT call offer()/waitForOfferAndAnswer() here: doing so creates
+    // an intermittent signaling race when the two phones subscribe at
+    // slightly different times.
     await currentCall.start();
 
     startedAt = Date.now();
@@ -437,4 +457,3 @@ function renderEditProfile() {
 }
 
 boot();
-    
