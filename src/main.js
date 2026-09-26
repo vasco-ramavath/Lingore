@@ -336,11 +336,6 @@ async function enterCall(callId, peerId, initiator) {
     };
 
     await currentCall.start();
-    if (initiator) {
-      await currentCall.offer();
-    } else {
-      await currentCall.waitForOfferAndAnswer();
-    }
 
     startedAt = Date.now();
     timer = setInterval(() => {
