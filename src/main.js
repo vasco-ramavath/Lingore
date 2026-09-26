@@ -230,7 +230,9 @@ async function startMatching() {
     await enterCall(payload.call_id, payload.peer_id, payload.initiator);
   });
 
-  const sub = await matchingChannel.subscribe();
+  const sub = await matchingChannel.subscribe((status, err) => {
+  console.log("MATCH REALTIME:", status, err);
+});
   if (sub !== "SUBSCRIBED") {
     cleanupMatch();
     await leaveQueue();
