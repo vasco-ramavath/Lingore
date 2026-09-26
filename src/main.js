@@ -218,7 +218,7 @@ async function startMatching() {
   };
 
   // Subscribe before queueing so the waiting user cannot miss a fast match event.
-  matchingChannel = supabase.channel(`match:${session.user.id}`, { config: { private: true } });
+  await supabase.realtime.setAuth(session.access_token); matchingChannel = supabase.channel(`match:${session.user.id}`, { config: { private: true } });
   matchingChannel.on("broadcast", { event: "matched" }, async ({ payload }) => {
     if (!matchingActive) return;
     matchingActive = false;
