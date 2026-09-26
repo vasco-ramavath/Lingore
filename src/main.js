@@ -230,13 +230,24 @@ async function startMatching() {
     await enterCall(payload.call_id, payload.peer_id, payload.initiator);
   });
 
-  await matchingChannel.subscribe((status, err) => {
-  console.log("MATCH REALTIME:", status, err);
+  const sub = await new Promise((resolve) => {
+  matchingChannel.subscribe((status, err) => {
+    console.log("MATCH REALTIME:", status, err);
+
+    if (status === "SUBSCRIBED") {
+      resolve("SUBSCRIBED");
+    } else if (
+      status === "CHANNEL_ERROR" ||
+      status === "TIMED_OUT" ||
+      status === "CLOSED"
+    ) {
+      console.error("MATCH CHANNEL ERROR:", status, err);
+      resolve(status);
+    }
+  });
 });
 
-const sub = matchingChannel.state;
-
-if (sub !== "joined") {
+if (sub !== "SUBSCRIBED") {
   cleanupMatch();
   await leaveQueue();
   alert("Could not connect to matchmaking. Please try again.");
