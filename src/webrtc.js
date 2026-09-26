@@ -2,54 +2,417 @@ import { supabase } from "./supabase.js";
 
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" }
-  // Production: add a TURN server here for users behind restrictive NATs.
 ];
 
 export class VoiceCall {
   constructor(callId, userId, remoteUserId) {
-    this.callId = callId; this.userId = userId; this.remoteUserId = remoteUserId;
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    this.channel = null; this.localStream = null; this.onState = () => {};
-    this.pc.onconnectionstatechange = () => this.onState(this.pc.connectionState);
+    this.callId = callId;
+    this.userId = userId;
+    this.remoteUserId = remoteUserId;
+
+    this.pc = new RTCPeerConnection({
+      iceServers: ICE_SERVERS
+    });
+
+    this.localStream = null;
+    this.channel = null;
+    this.onState = () => {};
+
+    this.remoteDescriptionSet = false;
+    this.pendingCandidates = [];
+    this.offerReceived = false;
+    this.answerReceived = false;
+    this.ended = false;
+    this.remoteAudio = null;
+    this.waitTimer = null;
+  }
+
+  setState(state) {
+    try {
+      this.onState(state);
+    } catch (_) {}
   }
 
   async start() {
-    this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    this.localStream.getTracks().forEach(t => this.pc.addTrack(t, this.localStream));
-    this.pc.ontrack = e => { this.remoteAudio = new Audio(); this.remoteAudio.autoplay = true; this.remoteAudio.srcObject = e.streams[0]; };
-    this.channel = supabase.channel(`call:${this.callId}`, { config: { private: true } });
-    this.channel.on("broadcast", { event: "signal" }, async ({ payload }) => {
-      if (payload.from === this.userId) return;
-      if (payload.type === "offer") await this.pc.setRemoteDescription(payload.offer);
-      if (payload.type === "answer") await this.pc.setRemoteDescription(payload.answer);
-      if (payload.type === "ice" && payload.candidate) await this.pc.addIceCandidate(payload.candidate);
-      if (payload.type === "hangup") this.onState("remote-hangup");
+    if (this.ended) {
+      throw new Error("Call has already ended.");
+    }
+
+    this.localStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
+      video: false
     });
-    this.pc.onicecandidate = e => {
-      if (e.candidate) this.channel.send({ type:"broadcast", event:"signal", payload:{type:"ice", candidate:e.candidate, from:this.userId} });
+
+    this.localStream.getTracks().forEach((track) => {
+      this.pc.addTrack(track, this.localStream);
+    });
+
+    // Receive the other person's voice.
+    this.pc.ontrack = (event) => {
+      if (!event.streams || !event.streams[0]) return;
+
+      if (!this.remoteAudio) {
+        this.remoteAudio = document.createElement("audio");
+        this.remoteAudio.autoplay = true;
+        this.remoteAudio.playsInline = true;
+        this.remoteAudio.style.display = "none";
+        document.body.appendChild(this.remoteAudio);
+      }
+
+      this.remoteAudio.srcObject = event.streams[0];
+
+      this.remoteAudio.play().catch(() => {
+        // Browser may require a user interaction before playback.
+      });
     };
-    await this.channel.subscribe();
-    return this;
+
+    this.pc.onconnectionstatechange = () => {
+      const state = this.pc.connectionState;
+
+      if (state === "connected") {
+        this.setState("connected");
+      } else if (state === "connecting") {
+        this.setState("connecting");
+      } else if (state === "disconnected") {
+        this.setState("reconnecting");
+      } else if (state === "failed") {
+        this.setState("failed");
+      } else if (state === "closed") {
+        this.setState("remote-hangup");
+      }
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      const state = this.pc.iceConnectionState;
+
+      if (state === "connected" || state === "completed") {
+        this.setState("connected");
+      } else if (state === "checking") {
+        this.setState("connecting");
+      } else if (state === "disconnected") {
+        this.setState("reconnecting");
+      } else if (state === "failed") {
+        this.setState("failed");
+      }
+    };
+
+    this.pc.onicecandidate = async (event) => {
+      if (!event.candidate || this.ended) return;
+
+      try {
+        await this.sendSignal({
+          type: "ice",
+          candidate: event.candidate,
+          from: this.userId
+        });
+      } catch (_) {}
+    };
+
+    this.channel = supabase.channel(`call:${this.callId}`, {
+      config: {
+        private: true
+      }
+    });
+
+    this.channel.on(
+      "broadcast",
+      { event: "signal" },
+      async ({ payload }) => {
+        if (
+          this.ended ||
+          !payload ||
+          payload.from === this.userId
+        ) {
+          return;
+        }
+
+        try {
+          if (payload.type === "offer") {
+            await this.handleOffer(payload.offer);
+          }
+
+          if (payload.type === "answer") {
+            await this.handleAnswer(payload.answer);
+          }
+
+          if (payload.type === "ice" && payload.candidate) {
+            await this.handleIceCandidate(payload.candidate);
+          }
+
+          if (payload.type === "hangup") {
+            this.setState("remote-hangup");
+          }
+        } catch (error) {
+          console.error("WebRTC signal error:", error);
+          this.setState("failed");
+        }
+      }
+    );
+
+    const status = await this.channel.subscribe();
+
+    if (status !== "SUBSCRIBED") {
+      throw new Error("Could not connect to call signaling.");
+    }
+
+    this.setState("connecting");
+  }
+
+  async sendSignal(payload) {
+    if (!this.channel || this.ended) return;
+
+    await this.channel.send({
+      type: "broadcast",
+      event: "signal",
+      payload
+    });
   }
 
   async offer() {
+    if (this.ended) return;
+
     const offer = await this.pc.createOffer();
+
     await this.pc.setLocalDescription(offer);
-    await this.channel.send({ type:"broadcast", event:"signal", payload:{type:"offer", offer, from:this.userId} });
+
+    await this.sendSignal({
+      type: "offer",
+      offer: this.pc.localDescription,
+      from: this.userId
+    });
   }
 
-  async answer() {
+  async handleOffer(offer) {
+    if (this.ended || !offer) return;
+
+    this.offerReceived = true;
+
+    await this.pc.setRemoteDescription(
+      new RTCSessionDescription(offer)
+    );
+
+    this.remoteDescriptionSet = true;
+
+    await this.flushPendingCandidates();
+
     const answer = await this.pc.createAnswer();
+
     await this.pc.setLocalDescription(answer);
-    await this.channel.send({ type:"broadcast", event:"signal", payload:{type:"answer", answer, from:this.userId} });
+
+    await this.sendSignal({
+      type: "answer",
+      answer: this.pc.localDescription,
+      from: this.userId
+    });
   }
 
-  async mute(muted) { this.localStream?.getAudioTracks().forEach(t => t.enabled = !muted); }
+  async handleAnswer(answer) {
+    if (
+      this.ended ||
+      !answer ||
+      this.answerReceived
+    ) {
+      return;
+    }
 
-  async end() {
-    try { await this.channel?.send({type:"broadcast",event:"signal",payload:{type:"hangup",from:this.userId}}); } catch {}
-    this.localStream?.getTracks().forEach(t => t.stop());
-    this.pc.close();
-    if (this.channel) await supabase.removeChannel(this.channel);
+    this.answerReceived = true;
+
+    await this.pc.setRemoteDescription(
+      new RTCSessionDescription(answer)
+    );
+
+    this.remoteDescriptionSet = true;
+
+    await this.flushPendingCandidates();
   }
-}
+
+  async handleIceCandidate(candidate) {
+    if (this.ended || !candidate) return;
+
+    if (!this.remoteDescriptionSet) {
+      this.pendingCandidates.push(candidate);
+      return;
+    }
+
+    try {
+      await this.pc.addIceCandidate(
+        new RTCIceCandidate(candidate)
+      );
+    } catch (error) {
+      console.warn("ICE candidate error:", error);
+    }
+  }
+
+  async flushPendingCandidates() {
+    if (
+      !this.remoteDescriptionSet ||
+      !this.pendingCandidates.length
+    ) {
+      return;
+    }
+
+    const candidates = this.pendingCandidates.splice(0);
+
+    for (const candidate of candidates) {
+      try {
+        await this.pc.addIceCandidate(
+          new RTCIceCandidate(candidate)
+        );
+      } catch (error) {
+        console.warn("Queued ICE candidate error:", error);
+      }
+    }
+  }
+
+  waitForOfferAndAnswer() {
+    return new Promise((resolve, reject) => {
+      if (this.ended) {
+        reject(new Error("Call has already ended."));
+        return;
+      }
+
+      if (this.pc.connectionState === "connected") {
+        resolve();
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        cleanup();
+
+        reject(
+          new Error(
+            "Timed out waiting for the other person."
+          )
+        );
+      }, 30000);
+
+      const check = () => {
+        if (this.ended) {
+          cleanup();
+
+          reject(new Error("Call ended."));
+          return;
+        }
+
+        if (this.pc.connectionState === "connected") {
+          cleanup();
+          resolve();
+          return;
+        }
+
+        if (this.pc.connectionState === "failed") {
+          cleanup();
+
+          reject(
+            new Error("Voice connection failed.")
+          );
+          return;
+        }
+
+        if (this.pc.connectionState === "closed") {
+          cleanup();
+
+          reject(new Error("Call ended."));
+        }
+      };
+
+      const oldHandler = this.onState;
+
+      this.onState = (state) => {
+        try {
+          oldHandler(state);
+        } catch (_) {}
+
+        if (state === "connected") {
+          cleanup();
+          resolve();
+        }
+
+        if (state === "failed") {
+          cleanup();
+
+          reject(
+            new Error("Voice connection failed.")
+          );
+        }
+
+        if (state === "remote-hangup") {
+          cleanup();
+
+          reject(new Error("Call ended."));
+        }
+      };
+
+      const interval = setInterval(check, 300);
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        clearInterval(interval);
+        this.onState = oldHandler;
+      };
+
+      check();
+    });
+  }
+
+  mute(muted) {
+    if (!this.localStream) return;
+
+    this.localStream
+      .getAudioTracks()
+      .forEach((track) => {
+        track.enabled = !muted;
+      });
+  }
+
+  async end(notifyRemote = true) {
+    if (this.ended) return;
+
+    this.ended = true;
+
+    if (notifyRemote && this.channel) {
+      try {
+        await this.sendSignal({
+          type: "hangup",
+          from: this.userId
+        });
+      } catch (_) {}
+    }
+
+    if (this.waitTimer) {
+      clearTimeout(this.waitTimer);
+      this.waitTimer = null;
+    }
+
+    if (this.localStream) {
+      this.localStream
+        .getTracks()
+        .forEach((track) => track.stop());
+
+      this.localStream = null;
+    }
+
+    if (this.remoteAudio) {
+      this.remoteAudio.pause();
+      this.remoteAudio.srcObject = null;
+      this.remoteAudio.remove();
+      this.remoteAudio = null;
+    }
+
+    try {
+      this.pc.close();
+    } catch (_) {}
+
+    if (this.channel) {
+      try {
+        await supabase.removeChannel(this.channel);
+      } catch (_) {}
+
+      this.channel = null;
+    }
+  }
+            }
