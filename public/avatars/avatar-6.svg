@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fce7f3"/>
+      <stop offset="1" stop-color="#ddd6fe"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="128" fill="url(#bg)"/>
+
+  <!-- long hair -->
+  <path d="M72 130c-5-53 19-88 56-88s61 35 56 88l-12 48H84z" fill="#38251f"/>
+  <path d="M78 112c8-38 27-57 50-57s42 19 50 57c-14-14-31-21-50-21s-36 7-50 21z" fill="#2b1b18"/>
+
+  <!-- face -->
+  <ellipse cx="128" cy="121" rx="46" ry="57" fill="#e2a47f"/>
+
+  <!-- ears -->
+  <circle cx="82" cy="122" r="9" fill="#e2a47f"/>
+  <circle cx="174" cy="122" r="9" fill="#e2a47f"/>
+
+  <!-- eyes -->
+  <ellipse cx="110" cy="119" rx="5" ry="6" fill="#241914"/>
+  <ellipse cx="146" cy="119" rx="5" ry="6" fill="#241914"/>
+
+  <!-- eyebrows -->
+  <path d="M98 103c7-4 16-4 23 0" fill="none" stroke="#38251f" stroke-width="4" stroke-linecap="round"/>
+  <path d="M135 103c7-4 16-4 23 0" fill="none" stroke="#38251f" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- nose -->
+  <path d="M128 119c-3 11-4 17 3 20" fill="none" stroke="#a96c51" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- smile -->
+  <path d="M111 148c10 9 24 9 34 0" fill="none" stroke="#8b4b43" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- neck -->
+  <path d="M108 169v30h40v-30" fill="#e2a47f"/>
+
+  <!-- shirt -->
+  <path d="M68 256v-41c0-27 25-45 60-45s60 18 60 45v41z" fill="#be185d"/>
+  <path d="M108 173l20 25 20-25" fill="#fdf2f8"/>
+</svg>
